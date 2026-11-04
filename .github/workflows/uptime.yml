@@ -1,0 +1,80 @@
+name: ptecorefree.com uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # state.txt commits (on change, and weekly to keep the schedule enabled)
+
+concurrency: uptime
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      URL: https://ptecorefree.com/
+      EXPECT: "PTE Core"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check site (3 tries, 20 s apart)
+        id: check
+        run: |
+          status=DOWN; detail=""
+          for i in 1 2 3; do
+            code=$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 20 -A 'Mozilla/5.0 (ptecorefree uptime monitor)' "$URL" || echo 000)
+            if [ "$code" = "200" ] && grep -q "$EXPECT" /tmp/body; then status=UP; detail="HTTP 200"; break; fi
+            detail="HTTP $code"
+            grep -q "Origin is unreachable" /tmp/body 2>/dev/null && detail="$detail, Cloudflare 523: VPS unreachable"
+            [ "$i" -lt 3 ] && sleep 20
+          done
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          echo "$status ($detail)"
+
+      - name: Notify on change, save state in state.txt
+        env:
+          BOT: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ steps.check.outputs.status }}
+          DETAIL: ${{ steps.check.outputs.detail }}
+        run: |
+          # state.txt = "<STATUS> <since epoch> <last alert epoch> <last commit epoch>"
+          read -r prev since last_alert last_commit < state.txt 2>/dev/null || true
+          now=$(date +%s); stamp=$(date -u '+%Y-%m-%d %H:%M UTC')
+          since=${since:-$now}; last_alert=${last_alert:-0}; last_commit=${last_commit:-0}
+          msg=""
+          if [ -z "$prev" ]; then
+            since=$now; msg="✅ Uptime monitor active. ptecorefree.com is $STATUS ($DETAIL). $stamp"
+          elif [ "$STATUS" != "$prev" ]; then
+            mins=$(( (now - since) / 60 )); since=$now
+            if [ "$STATUS" = "DOWN" ]; then
+              msg="🔴 ptecorefree.com is DOWN ($DETAIL). $stamp. If it stays down: my.contabo.com → VPS status."
+            else
+              msg="🟢 ptecorefree.com is back UP ($DETAIL) after about $mins min. $stamp"
+            fi
+          elif [ "$STATUS" = "DOWN" ] && [ $((now - last_alert)) -ge 1740 ]; then
+            msg="🔴 ptecorefree.com still DOWN for about $(( (now - since) / 60 )) min ($DETAIL). $stamp"
+          fi
+          if [ -n "$msg" ]; then
+            last_alert=$now
+            if [ -z "$BOT" ] || [ -z "$CHAT" ]; then
+              echo "::warning::TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID secrets missing, cannot send: $msg"
+            else
+              curl -sS --max-time 20 -X POST "https://api.telegram.org/bot${BOT}/sendMessage"                 --data-urlencode "chat_id=${CHAT}" --data-urlencode "text=${msg}" -o /tmp/tg || true
+              if grep -q '"ok":true' /tmp/tg; then echo "telegram sent: $msg"; else echo "::error::telegram failed"; head -c 300 /tmp/tg; echo; fi
+            fi
+          fi
+          # Commit only when something changed, or weekly (GitHub disables cron after 60 idle days).
+          if [ -n "$msg" ] || [ $((now - last_commit)) -gt 604800 ]; then
+            echo "$STATUS $since $last_alert $now" > state.txt
+            git config user.name "uptime-bot"
+            git config user.email "uptime-bot@users.noreply.github.com"
+            git add state.txt && git commit -qm "state: $STATUS $(date -u +%F' '%H:%M)" && git pull -q --rebase && git push -q
+            echo "state committed: $STATUS"
+          else
+            echo "no change: $STATUS"
+          fi
